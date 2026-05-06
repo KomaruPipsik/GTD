@@ -1,15 +1,18 @@
 -- AutomationScript.lua  (LocalScript → StarterPlayerScripts)
--- Roblox Luau | v3
--- Исправление: ВСЕ телепорты теперь ограничены границами DistanceFade.
--- Персонаж больше не может оказаться за пределами карты ни при каком условии.
+-- Roblox Luau | v4 — архитектура на основе главного цикла опроса
+-- Больше не зависит от ChildAdded для уже загруженных объектов.
+-- RunService.Heartbeat → опрос каждые 0.5 сек → надёжная работа.
 
-local Players  = game:GetService("Players")
+local Players    = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local VIM        = game:GetService("VirtualInputManager")
+
 local LocalPlayer = Players.LocalPlayer
 local PlayerGui   = LocalPlayer:WaitForChild("PlayerGui")
 
--- ══════════════════════════════════════════════════
---  UI
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  UI — ScreenGui + Toggle + Status
+-- ═══════════════════════════════════════════════════════════════
 
 local ScreenGui = Instance.new("ScreenGui")
 ScreenGui.Name           = "AutoUI"
@@ -18,7 +21,8 @@ ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 ScreenGui.Parent         = PlayerGui
 
 local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Size              = UDim2.new(0, 170, 0, 44)
+ToggleBtn.Name              = "ToggleBtn"
+ToggleBtn.Size              = UDim2.new(0, 180, 0, 46)
 ToggleBtn.Position          = UDim2.new(0, 12, 0, 12)
 ToggleBtn.BackgroundColor3  = Color3.fromRGB(50, 50, 50)
 ToggleBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
@@ -26,12 +30,17 @@ ToggleBtn.Font              = Enum.Font.GothamBold
 ToggleBtn.TextSize          = 14
 ToggleBtn.Text              = "⛔  Automation: OFF"
 ToggleBtn.BorderSizePixel   = 0
+ToggleBtn.AutoButtonColor   = false
 ToggleBtn.Parent            = ScreenGui
-Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 8)
+
+local BtnCorner = Instance.new("UICorner")
+BtnCorner.CornerRadius = UDim.new(0, 8)
+BtnCorner.Parent       = ToggleBtn
 
 local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Size                   = UDim2.new(0, 280, 0, 20)
-StatusLabel.Position               = UDim2.new(0, 12, 0, 62)
+StatusLabel.Name                   = "StatusLabel"
+StatusLabel.Size                   = UDim2.new(0, 320, 0, 20)
+StatusLabel.Position               = UDim2.new(0, 12, 0, 66)
 StatusLabel.BackgroundTransparency = 1
 StatusLabel.TextColor3             = Color3.fromRGB(160, 230, 160)
 StatusLabel.Font                   = Enum.Font.Gotham
@@ -41,142 +50,74 @@ StatusLabel.Text                   = "[ idle ]"
 StatusLabel.Parent                 = ScreenGui
 
 local function setStatus(msg)
-    StatusLabel.Text = "[ " .. msg .. " ]"
-    print("[AutoScript]", msg)
+    StatusLabel.Text = "[ " .. tostring(msg) .. " ]"
+    print("[Auto]", msg)
 end
 
--- ══════════════════════════════════════════════════
---  СОСТОЯНИЕ
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  ГЛОБАЛЬНОЕ СОСТОЯНИЕ
+-- ═══════════════════════════════════════════════════════════════
 
-local Enabled       = false
-local Connections   = {}
-local TempPlatform  = nil
-local PlotHandled   = {}
-local pumpBusy      = false
-local evading       = false
-local systemStarted = false
+local Enabled        = false   -- главный переключатель
+local HeartbeatConn  = nil     -- соединение с RunService.Heartbeat
+local LastPoll       = 0       -- время последнего опроса (секунды)
+local POLL_INTERVAL  = 0.5     -- интервал опроса (секунды)
 
-local function disconnectAll()
-    for _, c in ipairs(Connections) do
-        pcall(function() c:Disconnect() end)
-    end
-    Connections = {}
-    PlotHandled = {}
-end
+-- Флаги для предотвращения повторного запуска одноразовых действий
+local BossEvadeActive   = false   -- идёт уклонение от босса
+local PumpBusy          = false   -- идёт взаимодействие с насосом
+local BarrierHandled    = false   -- fenceBarrier уже обработан
+local PlotHandled       = {}      -- plot.Name → true
+local FinishDone        = false   -- Finish уже выполнен
 
-local function addConn(c)
-    table.insert(Connections, c)
-end
+-- Временная платформа для fenceBarrier
+local TempPlatform = nil
 
--- ══════════════════════════════════════════════════
---  ВСПОМОГАТЕЛЬНЫЕ
--- ══════════════════════════════════════════════════
+-- Кэш границ DistanceFade
+local BoundsMinV   = nil
+local BoundsMaxV   = nil
+local BoundsCenter = nil
+local BoundsReady  = false
 
+-- ═══════════════════════════════════════════════════════════════
+--  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+-- ═══════════════════════════════════════════════════════════════
+
+-- Безопасно получить HumanoidRootPart
 local function getHRP()
     local char = LocalPlayer.Character
     if not char then return nil end
     return char:FindFirstChild("HumanoidRootPart")
 end
 
-local function waitFor(parent, name, timeout)
-    if not parent then return nil end
-    local ok, res = pcall(function()
-        return parent:WaitForChild(name, timeout or 10)
-    end)
-    return (ok and res) or nil
-end
-
-local vim = game:GetService("VirtualInputManager")
-local function pressE()
-    pcall(function() vim:SendKeyEvent(true,  Enum.KeyCode.E, false, game) end)
-    task.wait(0.05)
-    pcall(function() vim:SendKeyEvent(false, Enum.KeyCode.E, false, game) end)
-end
-
--- Получаем позицию любого объекта (Model / BasePart)
-local function getPos(obj)
+-- Безопасно получить позицию объекта (Model или BasePart)
+local function getObjPos(obj)
     if not obj then return nil end
     if obj:IsA("BasePart") then
         return obj.Position
     elseif obj:IsA("Model") then
-        if obj.PrimaryPart then return obj.PrimaryPart.Position end
-        local p = obj:FindFirstChildWhichIsA("BasePart", true)
-        if p then return p.Position end
+        if obj.PrimaryPart then
+            return obj.PrimaryPart.Position
+        end
+        local bp = obj:FindFirstChildWhichIsA("BasePart", true)
+        if bp then return bp.Position end
     end
     return nil
 end
 
--- ══════════════════════════════════════════════════
---  DISTANCEFADE — AABB + кэш
---  Пересчитываем один раз за сессию; сбрасываем при
---  отключении кнопки (карта может перезагрузиться).
--- ══════════════════════════════════════════════════
-
-local cachedMinV   = nil
-local cachedMaxV   = nil
-local cachedCenter = nil
-local boundsReady  = false
-
-local function computeDistanceFadeBounds()
-    cachedMinV   = nil
-    cachedMaxV   = nil
-    cachedCenter = nil
-    boundsReady  = false
-
-    local map   = workspace:FindFirstChild("Map")
-    if not map then return end
-    local model = map:FindFirstChild("Model")
-    if not model then return end
-    local df    = model:FindFirstChild("DistanceFade")
-    if not df   then return end
-
-    local function expand(part)
-        if not part:IsA("BasePart") then return end
-        local s  = part.Size * 0.5
-        local cf = part.CFrame
-        for _, sx in ipairs({-1, 1}) do
-            for _, sy in ipairs({-1, 1}) do
-                for _, sz in ipairs({-1, 1}) do
-                    local c = (cf * CFrame.new(s.X * sx, s.Y * sy, s.Z * sz)).Position
-                    if not cachedMinV then
-                        cachedMinV = c
-                        cachedMaxV = c
-                    else
-                        cachedMinV = Vector3.new(
-                            math.min(cachedMinV.X, c.X),
-                            math.min(cachedMinV.Y, c.Y),
-                            math.min(cachedMinV.Z, c.Z)
-                        )
-                        cachedMaxV = Vector3.new(
-                            math.max(cachedMaxV.X, c.X),
-                            math.max(cachedMaxV.Y, c.Y),
-                            math.max(cachedMaxV.Z, c.Z)
-                        )
-                    end
-                end
-            end
-        end
-    end
-
-    -- Обходим все BasePart внутри DistanceFade
-    for _, p in ipairs(df:GetDescendants()) do
-        expand(p)
-    end
-    -- Сам DistanceFade может быть BasePart
-    if df:IsA("BasePart") then expand(df) end
-
-    if cachedMinV then
-        cachedCenter = (cachedMinV + cachedMaxV) * 0.5
-        boundsReady  = true
-        setStatus("DistanceFade bounds computed ✓")
-    else
-        setStatus("WARN: DistanceFade has no BaseParts")
-    end
+-- Нажатие клавиши E через VirtualInputManager
+local function pressE()
+    pcall(function()
+        VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+    end)
+    task.wait(0.05)
+    pcall(function()
+        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
 end
 
 -- Зажать вектор внутри AABB
-local function clamp3(v, mn, mx)
+local function clampVec3(v, mn, mx)
     return Vector3.new(
         math.clamp(v.X, mn.X, mx.X),
         math.clamp(v.Y, mn.Y, mx.Y),
@@ -184,20 +125,76 @@ local function clamp3(v, mn, mx)
     )
 end
 
--- Проверить, находится ли позиция внутри AABB
-local function isInsideBounds(pos)
-    if not boundsReady then return true end  -- нет данных — не блокируем
-    return pos.X >= cachedMinV.X and pos.X <= cachedMaxV.X
-       and pos.Y >= cachedMinV.Y and pos.Y <= cachedMaxV.Y
-       and pos.Z >= cachedMinV.Z and pos.Z <= cachedMaxV.Z
+-- ═══════════════════════════════════════════════════════════════
+--  DISTANCEFADE — вычисление AABB границ
+--  Вызывается один раз при старте, результат кэшируется.
+-- ═══════════════════════════════════════════════════════════════
+
+local function computeBounds()
+    BoundsMinV   = nil
+    BoundsMaxV   = nil
+    BoundsCenter = nil
+    BoundsReady  = false
+
+    local map = workspace:FindFirstChild("Map")
+    if not map then return end
+
+    local mapModel = map:FindFirstChild("Model")
+    if not mapModel then return end
+
+    local df = mapModel:FindFirstChild("DistanceFade")
+    if not df then return end
+
+    local function expandPart(part)
+        if not part:IsA("BasePart") then return end
+        local hs = part.Size * 0.5
+        local cf = part.CFrame
+        for _, sx in ipairs({-1, 1}) do
+            for _, sy in ipairs({-1, 1}) do
+                for _, sz in ipairs({-1, 1}) do
+                    local corner = (cf * CFrame.new(hs.X * sx, hs.Y * sy, hs.Z * sz)).Position
+                    if not BoundsMinV then
+                        BoundsMinV = corner
+                        BoundsMaxV = corner
+                    else
+                        BoundsMinV = Vector3.new(
+                            math.min(BoundsMinV.X, corner.X),
+                            math.min(BoundsMinV.Y, corner.Y),
+                            math.min(BoundsMinV.Z, corner.Z)
+                        )
+                        BoundsMaxV = Vector3.new(
+                            math.max(BoundsMaxV.X, corner.X),
+                            math.max(BoundsMaxV.Y, corner.Y),
+                            math.max(BoundsMaxV.Z, corner.Z)
+                        )
+                    end
+                end
+            end
+        end
+    end
+
+    -- df сам может быть BasePart
+    if df:IsA("BasePart") then expandPart(df) end
+
+    -- Все дочерние BasePart внутри DistanceFade
+    for _, desc in ipairs(df:GetDescendants()) do
+        expandPart(desc)
+    end
+
+    if BoundsMinV then
+        BoundsCenter = (BoundsMinV + BoundsMaxV) * 0.5
+        BoundsReady  = true
+        setStatus("DistanceFade bounds OK ✓")
+    else
+        setStatus("WARN: DistanceFade — no BaseParts found")
+    end
 end
 
--- ══════════════════════════════════════════════════
---  ТЕЛЕПОРТ — ЕДИНАЯ ТОЧКА ВХОДА
---  Все перемещения персонажа проходят через эту
---  функцию. Позиция всегда зажимается внутри
---  DistanceFade перед применением.
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  ЕДИНСТВЕННАЯ ТОЧКА ТЕЛЕПОРТА
+--  Все перемещения персонажа идут только через эту функцию.
+--  Позиция ВСЕГДА зажимается внутри DistanceFade.
+-- ═══════════════════════════════════════════════════════════════
 
 local function safeTeleport(targetPos, yOffset)
     if not targetPos then return end
@@ -206,276 +203,253 @@ local function safeTeleport(targetPos, yOffset)
     local hrp = getHRP()
     if not hrp then return end
 
-    -- Добавляем вертикальный отступ чтобы не проваливаться в пол
     local desired = targetPos + Vector3.new(0, yOffset, 0)
 
-    -- Ограничение границами DistanceFade
-    local finalPos
-    if boundsReady then
-        finalPos = clamp3(desired, cachedMinV, cachedMaxV)
-        -- Дополнительно гарантируем минимальный Y (пол зоны + зазор)
-        finalPos = Vector3.new(
-            finalPos.X,
-            math.max(finalPos.Y, cachedMinV.Y + 2),
-            finalPos.Z
-        )
+    local final
+    if BoundsReady then
+        -- Зажимаем внутри AABB DistanceFade
+        final = clampVec3(desired, BoundsMinV, BoundsMaxV)
+        -- Минимальный Y = пол зоны + небольшой зазор
+        final = Vector3.new(final.X, math.max(final.Y, BoundsMinV.Y + 2), final.Z)
     else
-        -- Границы не вычислены — телепортируем как есть, но логируем предупреждение
-        finalPos = desired
-        setStatus("WARN: bounds not ready, teleporting without clamp")
+        -- Границы ещё не готовы — пробуем пересчитать на месте
+        computeBounds()
+        if BoundsReady then
+            final = clampVec3(desired, BoundsMinV, BoundsMaxV)
+            final = Vector3.new(final.X, math.max(final.Y, BoundsMinV.Y + 2), final.Z)
+        else
+            -- Совсем нет данных — не телепортируем, логируем
+            setStatus("SKIP teleport: DistanceFade bounds unknown")
+            return
+        end
     end
 
-    hrp.CFrame = CFrame.new(finalPos)
+    hrp.CFrame = CFrame.new(final)
 end
 
--- ══════════════════════════════════════════════════
---  2. БОССЫ — Area Constraint
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  2. БОССЫ — уклонение с ограничением по DistanceFade
+-- ═══════════════════════════════════════════════════════════════
 
-local BOSS_NAMES = {
-    enemy_aa_king_octopus  = true,
-    enemy_aa_moth_overlord = true,
-    enemy_aa_snail_king    = true,
+local BOSS_SET = {
+    ["enemy_aa_king_octopus"]  = true,
+    ["enemy_aa_moth_overlord"] = true,
+    ["enemy_aa_snail_king"]    = true,
 }
 
-local function evadeEnemy(enemy)
-    if not Enabled or evading then return end
-    evading = true
+local function doEvade(bossObj)
+    if BossEvadeActive then return end
+    BossEvadeActive = true
 
     local hrp = getHRP()
-    if not hrp then evading = false; return end
+    if not hrp then BossEvadeActive = false; return end
 
-    setStatus("⚠ Boss: " .. enemy.Name .. " — evading")
+    setStatus("⚠ Boss: " .. bossObj.Name .. " — evading")
 
-    -- Вычисляем направление прочь от врага
-    local ePos = getPos(enemy) or hrp.Position
-    local dir  = hrp.Position - ePos
-    if dir.Magnitude < 0.5 then
-        -- Персонаж на том же месте что и враг — уходим в центр зоны
-        dir = boundsReady and (cachedCenter - hrp.Position) or Vector3.new(1, 0, 0)
-    end
-
-    -- Целевая позиция — 30 studs прочь от врага
-    local target = hrp.Position + dir.Unit * 30
-
-    -- safeTeleport автоматически зажмёт позицию внутри DistanceFade
-    -- yOffset = 0 чтобы не прыгать вверх без нужды
-    local desired = target
-
-    local finalPos
-    if boundsReady then
-        finalPos = clamp3(desired, cachedMinV, cachedMaxV)
-        finalPos = Vector3.new(finalPos.X, math.max(finalPos.Y, cachedMinV.Y + 4), finalPos.Z)
-    else
-        -- Только подъём на месте если нет данных о зоне
-        finalPos = hrp.Position + Vector3.new(0, 12, 0)
-    end
-
-    -- Временно снять CanTouch чтобы не триггерить хитбоксы при телепорте
+    -- Временно снимаем CanTouch
     local char = LocalPlayer.Character
     local savedTouch = {}
     if char then
-        for _, p in ipairs(char:GetDescendants()) do
-            if p:IsA("BasePart") then
-                savedTouch[p] = p.CanTouch
-                p.CanTouch = false
+        for _, part in ipairs(char:GetDescendants()) do
+            if part:IsA("BasePart") then
+                savedTouch[part] = part.CanTouch
+                part.CanTouch = false
             end
         end
     end
 
-    hrp.CFrame = CFrame.new(finalPos)
+    -- Вычисляем безопасную позицию внутри DistanceFade
+    local bossPos = getObjPos(bossObj) or hrp.Position
+    local awayDir = hrp.Position - bossPos
+    if awayDir.Magnitude < 0.5 then
+        awayDir = BoundsReady and (BoundsCenter - hrp.Position) or Vector3.new(1, 0, 0)
+    end
+
+    local target = hrp.Position + awayDir.Unit * 30
+
+    local safePos
+    if BoundsReady then
+        safePos = clampVec3(target, BoundsMinV, BoundsMaxV)
+        safePos = Vector3.new(safePos.X, math.max(safePos.Y, BoundsMinV.Y + 4), safePos.Z)
+    else
+        -- Нет данных о зоне — только подъём вертикально
+        safePos = hrp.Position + Vector3.new(0, 12, 0)
+    end
+
+    hrp.CFrame = CFrame.new(safePos)
     task.wait(2)
 
     -- Восстанавливаем CanTouch
     if char then
-        for p, v in pairs(savedTouch) do
-            if p and p.Parent then
-                p.CanTouch = v
+        for part, val in pairs(savedTouch) do
+            if part and part.Parent then
+                part.CanTouch = val
             end
         end
     end
 
-    evading = false
+    BossEvadeActive = false
     setStatus("running")
 end
 
-local function startBossWatcher(entities)
-    -- Уже существующие боссы на старте
+-- Проверка боссов: вызывается из главного цикла
+local function checkBosses()
+    if BossEvadeActive then return end
+
+    local map      = workspace:FindFirstChild("Map")
+    if not map then return end
+    local entities = map:FindFirstChild("Entities")
+    if not entities then return end
+
     for _, child in ipairs(entities:GetChildren()) do
-        if BOSS_NAMES[child.Name] then
-            task.spawn(evadeEnemy, child)
+        if BOSS_SET[child.Name] then
+            task.spawn(doEvade, child)
+            return  -- уклоняемся от первого найденного
         end
     end
-    -- Новые боссы
-    addConn(entities.ChildAdded:Connect(function(child)
-        if not Enabled then return end
-        if BOSS_NAMES[child.Name] then
-            task.spawn(evadeEnemy, child)
-        end
-    end))
 end
 
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 --  3. АВТО-ФИНИШ
---  Телепорт происходит через safeTeleport —
---  позиция Finish зажата внутри DistanceFade.
--- ══════════════════════════════════════════════════
+--  Проверяем: внутри Finish.Finish есть Model с MeshPart и MeshPart2
+-- ═══════════════════════════════════════════════════════════════
 
-local function startAutoFinish(loadedGame)
+local function checkAutoFinish(loadedGame)
+    if FinishDone then return end
+
     local finishFolder = loadedGame:FindFirstChild("Finish")
-    if not finishFolder then
-        setStatus("WARN: Finish folder not found")
-        return
-    end
+    if not finishFolder then return end
 
     local finishObj = finishFolder:FindFirstChild("Finish")
-    if not finishObj then
-        setStatus("WARN: Finish object not found")
-        return
-    end
+    if not finishObj then return end
 
-    local function tryFinish(child)
-        if not Enabled then return end
-        if not child:IsA("Model") then return end
-
-        local hasMesh1 = child:FindFirstChild("MeshPart")
-        local hasMesh2 = child:FindFirstChild("MeshPart2")
-
-        if hasMesh1 and hasMesh2 then
-            setStatus("Finish assets loaded — teleporting to Finish")
-            local pos = getPos(finishObj)
-            -- safeTeleport зажмёт позицию внутри DistanceFade
-            safeTeleport(pos, 3)
+    -- Ищем Model внутри которой есть и MeshPart и MeshPart2
+    for _, child in ipairs(finishObj:GetChildren()) do
+        if child:IsA("Model") then
+            local hasMesh1 = child:FindFirstChild("MeshPart")
+            local hasMesh2 = child:FindFirstChild("MeshPart2")
+            if hasMesh1 and hasMesh2 then
+                setStatus("Finish assets ready — teleporting ✓")
+                local pos = getObjPos(finishObj)
+                safeTeleport(pos, 3)
+                FinishDone = true
+                return
+            end
         end
     end
-
-    -- Проверяем уже загруженные дочерние объекты
-    for _, child in ipairs(finishObj:GetChildren()) do
-        tryFinish(child)
-    end
-
-    -- Слушаем новые
-    addConn(finishObj.ChildAdded:Connect(tryFinish))
 end
 
--- ══════════════════════════════════════════════════
---  4а. unit_pump
---  Телепорт через safeTeleport — зажат в DistanceFade.
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  4а. UNIT PUMP — взаимодействие 3 секунды
+-- ═══════════════════════════════════════════════════════════════
 
-local function handleUnitPump(pump)
-    if not Enabled or pumpBusy then return end
-    pumpBusy = true
+local function doUnitPump(pump)
+    if PumpBusy then return end
+    PumpBusy = true
 
-    setStatus("Moving → unit_pump")
-    local pos = getPos(pump)
-
-    -- safeTeleport проверит что позиция pump внутри зоны
-    -- Если pump за пределами — персонаж встанет у края границы
+    setStatus("Moving to unit_pump...")
+    local pos = getObjPos(pump)
     safeTeleport(pos, 3)
-    task.wait(0.6)
+    task.wait(0.8)   -- даём физике устаканиться
 
-    setStatus("Interacting unit_pump (3s)")
+    setStatus("Interacting with unit_pump (3s)...")
     local elapsed = 0
     while elapsed < 3 and Enabled do
         pressE()
         task.wait(0.2)
-        elapsed += 0.2
+        elapsed = elapsed + 0.2
     end
 
-    pumpBusy = false
-    setStatus("unit_pump interaction done ✓")
+    PumpBusy = false
+    setStatus("unit_pump done ✓")
 end
 
--- ══════════════════════════════════════════════════
---  4б. fenceBarrier
---  Подъём +15 studs тоже проходит через safeTeleport.
---  Платформа создаётся под новой (зажатой) позицией.
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  4б. FENCE BARRIER — подъём на 15 studs + временная платформа
+-- ═══════════════════════════════════════════════════════════════
 
-local function handleFenceBarrier()
-    if not Enabled then return end
+local function doFenceBarrier()
+    if BarrierHandled then return end
+    BarrierHandled = true
+
     local hrp = getHRP()
     if not hrp then return end
 
-    setStatus("FenceBarrier detected — lifting +15 studs")
+    setStatus("FenceBarrier — lifting +15 studs")
 
-    -- Желаемая позиция: +15 studs вверх
+    -- Желаемая позиция: текущая + 15 вверх
     local desiredPos = hrp.Position + Vector3.new(0, 15, 0)
 
-    -- Зажать внутри DistanceFade
+    -- Зажимаем внутри DistanceFade
     local finalPos
-    if boundsReady then
-        finalPos = clamp3(desiredPos, cachedMinV, cachedMaxV)
-        -- Если зона невысокая — берём максимально возможный Y внутри зоны
-        finalPos = Vector3.new(finalPos.X, math.max(finalPos.Y, cachedMinV.Y + 2), finalPos.Z)
+    if BoundsReady then
+        finalPos = clampVec3(desiredPos, BoundsMinV, BoundsMaxV)
+        finalPos = Vector3.new(finalPos.X, math.max(finalPos.Y, BoundsMinV.Y + 2), finalPos.Z)
     else
         finalPos = desiredPos
     end
 
     hrp.CFrame = CFrame.new(finalPos)
 
-    -- Удаляем старую платформу если была
+    -- Убираем старую платформу
     if TempPlatform and TempPlatform.Parent then
         TempPlatform:Destroy()
         TempPlatform = nil
     end
 
-    -- Создаём временную платформу СТРОГО под финальной (зажатой) позицией
-    local platform        = Instance.new("Part")
-    platform.Name         = "TempPlatform_Auto"
-    platform.Size         = Vector3.new(8, 0.6, 8)
-    platform.Anchored     = true
-    platform.CanCollide   = true
-    platform.Transparency = 0.4
-    platform.BrickColor   = BrickColor.new("Bright yellow")
-    platform.CFrame       = CFrame.new(finalPos - Vector3.new(0, 3, 0))
-    platform.Parent       = workspace
-    TempPlatform          = platform
+    -- Создаём платформу строго под финальной (зажатой) позицией
+    local plat            = Instance.new("Part")
+    plat.Name             = "TempPlatform_Auto"
+    plat.Size             = Vector3.new(8, 0.6, 8)
+    plat.Anchored         = true
+    plat.CanCollide       = true
+    plat.Transparency     = 0.35
+    plat.BrickColor       = BrickColor.new("Bright yellow")
+    plat.CFrame           = CFrame.new(finalPos - Vector3.new(0, 3.3, 0))
+    plat.Parent           = workspace
+    TempPlatform          = plat
 
-    -- Автоматическое удаление платформы через 10 секунд
+    -- Авто-удаление через 10 секунд
     task.delay(10, function()
-        if platform and platform.Parent then
-            platform:Destroy()
+        if plat and plat.Parent then
+            plat:Destroy()
         end
-        if TempPlatform == platform then
+        if TempPlatform == plat then
             TempPlatform = nil
         end
+        -- Разрешаем повторное срабатывание если барьер появится снова
+        BarrierHandled = false
         if Enabled then setStatus("running") end
     end)
 end
 
-local function startAssetsWatcher(assets)
-    local function onAsset(child)
-        if not Enabled then return end
-        if child.Name == "unit_pump" then
-            task.spawn(handleUnitPump, child)
-        elseif child.Name == "fenceBarrier" then
-            task.spawn(handleFenceBarrier)
-        end
+-- Проверка Assets: вызывается из главного цикла
+local function checkAssets(loadedGame)
+    local assets = loadedGame:FindFirstChild("Assets")
+    if not assets then return end
+
+    -- unit_pump
+    local pump = assets:FindFirstChild("unit_pump")
+    if pump and not PumpBusy then
+        task.spawn(doUnitPump, pump)
     end
 
-    -- Уже существующие ассеты
-    for _, child in ipairs(assets:GetChildren()) do
-        onAsset(child)
+    -- fenceBarrier
+    local barrier = assets:FindFirstChild("fenceBarrier")
+    if barrier and not BarrierHandled then
+        task.spawn(doFenceBarrier)
     end
-
-    -- Новые ассеты
-    addConn(assets.ChildAdded:Connect(onAsset))
 end
 
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 --  5. PLOTS 1–20
---  Телепорт к unit_pump проходит через handleUnitPump,
---  который вызывает safeTeleport — позиция зажата.
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 
-local function handlePlot(plot, assets)
-    -- Защита от двойного запуска одного и того же плота
-    if PlotHandled[plot.Name] then return end
+local function doPlot(plot, assets)
+    -- Помечаем как обработанный сразу, чтобы главный цикл не запустил снова
     PlotHandled[plot.Name] = true
 
-    setStatus("Plot '" .. plot.Name .. "' appeared — waiting 5s")
+    setStatus("Plot '" .. plot.Name .. "' — waiting 5 seconds...")
     task.wait(5)
     if not Enabled then return end
 
@@ -483,196 +457,177 @@ local function handlePlot(plot, assets)
     local hrp = getHRP()
     local savedPos = hrp and hrp.Position or nil
     if savedPos then
-        setStatus("Plot '" .. plot.Name .. "' — saved pos: " .. tostring(savedPos))
+        setStatus("Plot '" .. plot.Name .. "' — saved pos: " .. tostring(math.floor(savedPos.X)) .. ", " .. tostring(math.floor(savedPos.Y)) .. ", " .. tostring(math.floor(savedPos.Z)))
     end
 
-    -- Цикл нажатия E в течение 2 секунд
-    setStatus("Plot '" .. plot.Name .. "' — pressing E (2s)")
+    -- Цикл нажатия E на 2 секунды
+    setStatus("Plot '" .. plot.Name .. "' — pressing E (2s)...")
     local elapsed = 0
     while elapsed < 2 and Enabled do
         pressE()
         task.wait(0.2)
-        elapsed += 0.2
+        elapsed = elapsed + 0.2
     end
     if not Enabled then return end
 
-    -- Перемещение к unit_pump (через handleUnitPump → safeTeleport → DistanceFade clamp)
+    -- Перемещаемся к unit_pump
     local pump = assets:FindFirstChild("unit_pump")
     if pump then
-        handleUnitPump(pump)
+        doUnitPump(pump)
     else
-        setStatus("Plot: unit_pump not found yet — waiting...")
-        local p = waitFor(assets, "unit_pump", 20)
-        if p and Enabled then
-            handleUnitPump(p)
+        -- unit_pump ещё не появился — ждём до 20 секунд
+        setStatus("Plot: waiting for unit_pump...")
+        local waited = 0
+        while waited < 20 and Enabled do
+            task.wait(0.5)
+            waited = waited + 0.5
+            pump = assets:FindFirstChild("unit_pump")
+            if pump then break end
+        end
+        if pump and Enabled then
+            doUnitPump(pump)
         else
-            setStatus("Plot: unit_pump wait timeout")
+            setStatus("Plot: unit_pump timeout")
         end
     end
 end
 
-local function startPlotsWatcher(plots, assets)
-    local function onPlot(child)
-        if not Enabled then return end
+-- Проверка Plots: вызывается из главного цикла
+local function checkPlots(loadedGame)
+    local plots = loadedGame:FindFirstChild("Plots")
+    if not plots then return end
+
+    local assets = loadedGame:FindFirstChild("Assets")
+    if not assets then return end
+
+    for _, child in ipairs(plots:GetChildren()) do
         local n = tonumber(child.Name)
         if n and n >= 1 and n <= 20 then
-            task.spawn(handlePlot, child, assets)
+            if not PlotHandled[child.Name] then
+                task.spawn(doPlot, child, assets)
+            end
         end
     end
+end
 
-    -- Уже существующие плоты
-    for _, child in ipairs(plots:GetChildren()) do
-        onPlot(child)
+-- ═══════════════════════════════════════════════════════════════
+--  ГЛАВНЫЙ ЦИКЛ ОПРОСА
+--  Срабатывает каждые POLL_INTERVAL секунд пока Enabled = true.
+--  Проверяет ВСЕ условия независимо — даже если объекты уже
+--  существовали до включения скрипта.
+-- ═══════════════════════════════════════════════════════════════
+
+local function onHeartbeat(dt)
+    if not Enabled then return end
+
+    -- Ограничиваем частоту: не чаще раза в POLL_INTERVAL секунд
+    LastPoll = LastPoll + dt
+    if LastPoll < POLL_INTERVAL then return end
+    LastPoll = 0
+
+    -- Ищем корневой Map
+    local map = workspace:FindFirstChild("Map")
+    if not map then
+        setStatus("Waiting: workspace.Map...")
+        return
     end
 
-    -- Новые плоты
-    addConn(plots.ChildAdded:Connect(onPlot))
+    -- Пересчитываем границы если ещё не готовы
+    if not BoundsReady then
+        computeBounds()
+    end
+
+    -- 2. Проверяем боссов
+    checkBosses()
+
+    -- Ищем LoadedGame
+    local loadedGame = map:FindFirstChild("LoadedGame")
+    if not loadedGame then
+        setStatus("Waiting: Map.LoadedGame...")
+        return
+    end
+
+    -- 3. Авто-Финиш
+    checkAutoFinish(loadedGame)
+
+    -- 4. Ассеты (unit_pump + fenceBarrier)
+    checkAssets(loadedGame)
+
+    -- 5. Плоты
+    checkPlots(loadedGame)
 end
 
--- ══════════════════════════════════════════════════
---  ЗАПУСК ВСЕХ СИСТЕМ
---  Вызывается один раз при первом нажатии кнопки.
---  Сначала вычисляем границы DistanceFade, потом
---  запускаем все вотчеры — только после этого
---  любой телепорт будет безопасен.
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
+--  СБРОС СОСТОЯНИЯ (при выключении)
+-- ═══════════════════════════════════════════════════════════════
 
-local function startSystems()
-    if systemStarted then return end
-    systemStarted = true
-    setStatus("Initializing — waiting for Map...")
+local function resetState()
+    BossEvadeActive = false
+    PumpBusy        = false
+    BarrierHandled  = false
+    FinishDone      = false
+    PlotHandled     = {}
+    LastPoll        = 0
 
-    task.spawn(function()
-        local map = waitFor(workspace, "Map", 30)
-        if not map then
-            setStatus("ERROR: workspace.Map not found within 30s")
-            return
-        end
+    BoundsMinV   = nil
+    BoundsMaxV   = nil
+    BoundsCenter = nil
+    BoundsReady  = false
 
-        -- Ждём Model и DistanceFade, потом вычисляем границы
-        -- Все последующие телепорты зависят от этих данных
-        local mapModel = map:FindFirstChild("Model")
-        if not mapModel then
-            setStatus("WARN: Map.Model not found — waiting...")
-            mapModel = waitFor(map, "Model", 20)
-        end
-
-        if mapModel then
-            local df = mapModel:FindFirstChild("DistanceFade")
-            if not df then
-                setStatus("WARN: DistanceFade not found — waiting...")
-                df = waitFor(mapModel, "DistanceFade", 20)
-            end
-            if df then
-                computeDistanceFadeBounds()
-            else
-                setStatus("ERROR: DistanceFade never appeared — teleports will be UNSAFE")
-            end
-        else
-            setStatus("ERROR: Map.Model never appeared — teleports will be UNSAFE")
-        end
-
-        -- Entities / боссы
-        task.spawn(function()
-            local entities = map:FindFirstChild("Entities") or waitFor(map, "Entities", 30)
-            if entities and Enabled then
-                startBossWatcher(entities)
-            elseif not entities then
-                setStatus("WARN: Entities folder not found")
-            end
-        end)
-
-        -- LoadedGame
-        local loadedGame = map:FindFirstChild("LoadedGame") or waitFor(map, "LoadedGame", 30)
-        if not loadedGame then
-            setStatus("ERROR: LoadedGame not found within 30s")
-            return
-        end
-
-        -- Assets
-        local assets = loadedGame:FindFirstChild("Assets") or waitFor(loadedGame, "Assets", 20)
-        if assets then
-            startAssetsWatcher(assets)
-        else
-            setStatus("WARN: Assets not found — waiting longer...")
-            task.spawn(function()
-                local a = waitFor(loadedGame, "Assets", 60)
-                if a and Enabled then
-                    startAssetsWatcher(a)
-                else
-                    setStatus("ERROR: Assets never appeared")
-                end
-            end)
-        end
-
-        -- Plots
-        local plots = loadedGame:FindFirstChild("Plots") or waitFor(loadedGame, "Plots", 20)
-        if plots then
-            if assets then
-                startPlotsWatcher(plots, assets)
-            else
-                -- assets появится позже — ждём
-                task.spawn(function()
-                    local a = loadedGame:FindFirstChild("Assets") or waitFor(loadedGame, "Assets", 30)
-                    if a and Enabled then
-                        startPlotsWatcher(plots, a)
-                    end
-                end)
-            end
-        else
-            setStatus("WARN: Plots not found — waiting longer...")
-            task.spawn(function()
-                local p = waitFor(loadedGame, "Plots", 60)
-                local a = loadedGame:FindFirstChild("Assets") or waitFor(loadedGame, "Assets", 30)
-                if p and a and Enabled then
-                    startPlotsWatcher(p, a)
-                end
-            end)
-        end
-
-        -- AutoFinish
-        startAutoFinish(loadedGame)
-
-        if Enabled then
-            setStatus("All systems active ✓")
-        end
-    end)
+    if TempPlatform and TempPlatform.Parent then
+        TempPlatform:Destroy()
+        TempPlatform = nil
+    end
 end
 
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 --  КНОПКА TOGGLE
--- ══════════════════════════════════════════════════
+-- ═══════════════════════════════════════════════════════════════
 
 ToggleBtn.MouseButton1Click:Connect(function()
     Enabled = not Enabled
 
     if Enabled then
+        -- Включаем
         ToggleBtn.Text             = "✅  Automation: ON"
         ToggleBtn.BackgroundColor3 = Color3.fromRGB(25, 110, 25)
-        pumpBusy      = false
-        evading       = false
-        startSystems()
-    else
-        ToggleBtn.Text             = "⛔  Automation: OFF"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
-        disconnectAll()
+        LastPoll = POLL_INTERVAL   -- чтобы первый цикл сработал немедленно
 
-        -- Очищаем временную платформу
-        if TempPlatform and TempPlatform.Parent then
-            TempPlatform:Destroy()
-            TempPlatform = nil
+        -- Подключаем главный цикл если ещё не подключён
+        if not HeartbeatConn then
+            HeartbeatConn = RunService.Heartbeat:Connect(onHeartbeat)
         end
 
-        -- Сбрасываем кэш границ — при следующем включении пересчитаем
-        cachedMinV   = nil
-        cachedMaxV   = nil
-        cachedCenter = nil
-        boundsReady  = false
+        setStatus("enabled — scanning...")
+    else
+        -- Выключаем
+        ToggleBtn.Text             = "⛔  Automation: OFF"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(50, 50, 50)
 
-        pumpBusy      = false
-        evading       = false
-        systemStarted = false
+        -- Отключаем главный цикл
+        if HeartbeatConn then
+            HeartbeatConn:Disconnect()
+            HeartbeatConn = nil
+        end
 
+        resetState()
         setStatus("idle")
+    end
+end)
+
+-- ═══════════════════════════════════════════════════════════════
+--  Респавн персонажа — сбрасываем флаги чтобы всё отработало
+--  заново для нового персонажа
+-- ═══════════════════════════════════════════════════════════════
+
+LocalPlayer.CharacterAdded:Connect(function()
+    if Enabled then
+        BossEvadeActive = false
+        PumpBusy        = false
+        BarrierHandled  = false
+        FinishDone      = false
+        PlotHandled     = {}
+        LastPoll        = POLL_INTERVAL
+        setStatus("Character respawned — restarting scan")
     end
 end)
