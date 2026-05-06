@@ -1,145 +1,146 @@
--- AutomationScript.lua
--- LocalScript: Система автоматизации и отладки карты (Roblox Studio)
--- Помести в StarterPlayerScripts или StarterCharacterScripts
+-- AutomationScript.lua  (LocalScript → StarterPlayerScripts)
+-- Исправлено: все системы стартуют ТОЛЬКО при включении тоггла
 
-local Players         = game:GetService("Players")
-local RunService      = game:GetService("RunService")
-local UserInputService = game:GetService("UserInputService")
-local TweenService    = game:GetService("TweenService")
+local Players          = game:GetService("Players")
+local RunService       = game:GetService("RunService")
 
 local LocalPlayer  = Players.LocalPlayer
 local PlayerGui    = LocalPlayer:WaitForChild("PlayerGui")
 
--- ════════════════════════════════════════════════
---  1. ИНТЕРФЕЙС УПРАВЛЕНИЯ (ScreenGui + Toggle)
--- ════════════════════════════════════════════════
+-- ══════════════════════════════════════════
+--  UI
+-- ══════════════════════════════════════════
 
 local ScreenGui = Instance.new("ScreenGui")
-ScreenGui.Name            = "AutomationUI"
-ScreenGui.ResetOnSpawn    = false
-ScreenGui.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
-ScreenGui.Parent          = PlayerGui
+ScreenGui.Name           = "AutomationUI"
+ScreenGui.ResetOnSpawn   = false
+ScreenGui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+ScreenGui.Parent         = PlayerGui
+
+local Frame = Instance.new("Frame")
+Frame.Size              = UDim2.new(0, 200, 0, 70)
+Frame.Position          = UDim2.new(0, 12, 0, 12)
+Frame.BackgroundColor3  = Color3.fromRGB(20, 20, 20)
+Frame.BorderSizePixel   = 0
+Frame.Parent            = ScreenGui
+Instance.new("UICorner", Frame).CornerRadius = UDim.new(0, 10)
 
 local ToggleBtn = Instance.new("TextButton")
-ToggleBtn.Name            = "ToggleBtn"
-ToggleBtn.Size            = UDim2.new(0, 160, 0, 40)
-ToggleBtn.Position        = UDim2.new(0, 16, 0, 16)
-ToggleBtn.AnchorPoint     = Vector2.new(0, 0)
-ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-ToggleBtn.TextColor3      = Color3.fromRGB(255, 255, 255)
-ToggleBtn.Font            = Enum.Font.GothamBold
-ToggleBtn.TextSize        = 14
-ToggleBtn.Text            = "⛔  Automation: OFF"
-ToggleBtn.BorderSizePixel = 0
-ToggleBtn.Parent          = ScreenGui
-
-local Corner = Instance.new("UICorner")
-Corner.CornerRadius = UDim.new(0, 8)
-Corner.Parent       = ToggleBtn
+ToggleBtn.Size              = UDim2.new(1, -16, 0, 34)
+ToggleBtn.Position          = UDim2.new(0, 8, 0, 8)
+ToggleBtn.BackgroundColor3  = Color3.fromRGB(180, 40, 40)
+ToggleBtn.TextColor3        = Color3.fromRGB(255, 255, 255)
+ToggleBtn.Font              = Enum.Font.GothamBold
+ToggleBtn.TextSize          = 14
+ToggleBtn.Text              = "Automation: OFF"
+ToggleBtn.BorderSizePixel   = 0
+ToggleBtn.Parent            = Frame
+Instance.new("UICorner", ToggleBtn).CornerRadius = UDim.new(0, 6)
 
 local StatusLabel = Instance.new("TextLabel")
-StatusLabel.Name            = "StatusLabel"
-StatusLabel.Size            = UDim2.new(0, 220, 0, 24)
-StatusLabel.Position        = UDim2.new(0, 16, 0, 64)
+StatusLabel.Size                   = UDim2.new(1, -16, 0, 18)
+StatusLabel.Position               = UDim2.new(0, 8, 0, 48)
 StatusLabel.BackgroundTransparency = 1
-StatusLabel.TextColor3      = Color3.fromRGB(180, 180, 180)
-StatusLabel.Font            = Enum.Font.Gotham
-StatusLabel.TextSize        = 12
-StatusLabel.TextXAlignment  = Enum.TextXAlignment.Left
-StatusLabel.Text            = "Status: idle"
-StatusLabel.Parent          = ScreenGui
+StatusLabel.TextColor3             = Color3.fromRGB(160, 160, 160)
+StatusLabel.Font                   = Enum.Font.Gotham
+StatusLabel.TextSize               = 11
+StatusLabel.TextXAlignment         = Enum.TextXAlignment.Left
+StatusLabel.Text                   = "idle"
+StatusLabel.Parent                 = Frame
 
--- Состояние системы
-local Enabled       = false
-local ActiveThreads = {}   -- таблица корутин/потоков для отмены
-local TempPlatform  = nil  -- временная платформа FenceBarrier
+-- ══════════════════════════════════════════
+--  СОСТОЯНИЕ
+-- ══════════════════════════════════════════
+
+local Enabled      = false
+local Connections  = {}
+local TempPlatform = nil
 
 local function setStatus(msg)
-    StatusLabel.Text = "Status: " .. msg
+    StatusLabel.Text = msg
+    print("[Automation] " .. msg)   -- дублируем в консоль Studio
 end
 
-local function killThreads()
-    for _, t in ipairs(ActiveThreads) do
-        if task.cancel then
-            pcall(task.cancel, t)
-        end
+local function stopAll()
+    for _, c in ipairs(Connections) do
+        pcall(function() c:Disconnect() end)
     end
-    ActiveThreads = {}
+    Connections = {}
+    if TempPlatform and TempPlatform.Parent then
+        TempPlatform:Destroy()
+        TempPlatform = nil
+    end
+    setStatus("idle")
 end
 
-ToggleBtn.MouseButton1Click:Connect(function()
-    Enabled = not Enabled
-    if Enabled then
-        ToggleBtn.Text            = "✅  Automation: ON"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(30, 100, 30)
-        setStatus("running")
-    else
-        ToggleBtn.Text            = "⛔  Automation: OFF"
-        ToggleBtn.BackgroundColor3 = Color3.fromRGB(40, 40, 40)
-        killThreads()
-        -- Убираем временную платформу
-        if TempPlatform and TempPlatform.Parent then
-            TempPlatform:Destroy()
-            TempPlatform = nil
-        end
-        setStatus("idle")
-    end
-end)
+-- ══════════════════════════════════════════
+--  ХЕЛПЕРЫ
+-- ══════════════════════════════════════════
 
--- ════════════════════════════════════════════════
---  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
--- ════════════════════════════════════════════════
-
--- Безопасное получение персонажа и HumanoidRootPart
-local function getCharacter()
+local function getHRP()
     local char = LocalPlayer.Character
-    if not char then return nil, nil, nil end
-    local hrp  = char:FindFirstChild("HumanoidRootPart")
-    local hum  = char:FindFirstChildOfClass("Humanoid")
-    return char, hrp, hum
+    if not char then return nil end
+    return char:FindFirstChild("HumanoidRootPart")
 end
 
--- Имитация нажатия клавиши (FireServer не нужен — работаем на клиенте)
+local vim = game:GetService("VirtualInputManager")
 local function pressE()
-    -- Используем VirtualInputManager если доступен (Studio), иначе эмуляция через UIS
-    local via = game:GetService("VirtualInputManager")
-    if via then
-        via:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+    pcall(function()
+        vim:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
         task.wait(0.05)
-        via:SendKeyEvent(false, Enum.KeyCode.E, false, game)
-    end
+        vim:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+    end)
 end
 
--- Получаем границы (BoundingBox) модели DistanceFade
+local function teleport(pos)
+    local hrp = getHRP()
+    if hrp then hrp.CFrame = CFrame.new(pos) end
+end
+
+local function getPos(obj)
+    if obj:IsA("BasePart") then return obj.Position end
+    if obj:IsA("Model") then
+        if obj.PrimaryPart then return obj.PrimaryPart.Position end
+        local p = obj:FindFirstChildWhichIsA("BasePart")
+        if p then return p.Position end
+    end
+    return Vector3.new(0,0,0)
+end
+
+-- Ждём дочерний объект без WaitForChild (polling, не бросает ошибки)
+local function waitFor(parent, name, timeout)
+    local t0 = os.clock()
+    timeout = timeout or 30
+    local child = parent:FindFirstChild(name)
+    while not child and os.clock()-t0 < timeout do
+        task.wait(0.3)
+        child = parent:FindFirstChild(name)
+    end
+    return child
+end
+
+-- AABB модели DistanceFade
 local function getDistanceFadeBounds()
-    local map   = workspace:FindFirstChild("Map")
+    local map = workspace:FindFirstChild("Map")
     if not map then return nil, nil end
-    local model = map:FindFirstChild("Model")
-    if not model then return nil, nil end
-    local df    = model:FindFirstChild("DistanceFade")
-    if not df   then return nil, nil end
-    -- Вычисляем AABB модели
+    local mdl = map:FindFirstChild("Model")
+    if not mdl then return nil, nil end
+    local df  = mdl:FindFirstChild("DistanceFade")
+    if not df  then return nil, nil end
     local minV, maxV
     for _, part in ipairs(df:GetDescendants()) do
         if part:IsA("BasePart") then
-            local s = part.Size / 2
-            local cf = part.CFrame
+            local s = part.Size/2; local cf = part.CFrame
             local corners = {
-                cf * Vector3.new( s.X,  s.Y,  s.Z),
-                cf * Vector3.new(-s.X,  s.Y,  s.Z),
-                cf * Vector3.new( s.X, -s.Y,  s.Z),
-                cf * Vector3.new(-s.X, -s.Y,  s.Z),
-                cf * Vector3.new( s.X,  s.Y, -s.Z),
-                cf * Vector3.new(-s.X,  s.Y, -s.Z),
-                cf * Vector3.new( s.X, -s.Y, -s.Z),
-                cf * Vector3.new(-s.X, -s.Y, -s.Z),
+                cf*Vector3.new( s.X, s.Y, s.Z), cf*Vector3.new(-s.X, s.Y, s.Z),
+                cf*Vector3.new( s.X,-s.Y, s.Z), cf*Vector3.new(-s.X,-s.Y, s.Z),
+                cf*Vector3.new( s.X, s.Y,-s.Z), cf*Vector3.new(-s.X, s.Y,-s.Z),
+                cf*Vector3.new( s.X,-s.Y,-s.Z), cf*Vector3.new(-s.X,-s.Y,-s.Z),
             }
             for _, c in ipairs(corners) do
-                if not minV then
-                    minV = c; maxV = c
-                else
-                    minV = Vector3.new(math.min(minV.X, c.X), math.min(minV.Y, c.Y), math.min(minV.Z, c.Z))
-                    maxV = Vector3.new(math.max(maxV.X, c.X), math.max(maxV.Y, c.Y), math.max(maxV.Z, c.Z))
+                if not minV then minV=c; maxV=c else
+                    minV = Vector3.new(math.min(minV.X,c.X),math.min(minV.Y,c.Y),math.min(minV.Z,c.Z))
+                    maxV = Vector3.new(math.max(maxV.X,c.X),math.max(maxV.Y,c.Y),math.max(maxV.Z,c.Z))
                 end
             end
         end
@@ -147,9 +148,8 @@ local function getDistanceFadeBounds()
     return minV, maxV
 end
 
--- Зажим вектора внутри AABB
-local function clampToBounds(pos, minV, maxV)
-    if not minV or not maxV then return pos end
+local function clamp3(pos, minV, maxV)
+    if not minV then return pos end
     return Vector3.new(
         math.clamp(pos.X, minV.X, maxV.X),
         math.clamp(pos.Y, minV.Y, maxV.Y),
@@ -157,348 +157,193 @@ local function clampToBounds(pos, minV, maxV)
     )
 end
 
--- Безопасное перемещение персонажа (с ограничением по DistanceFade)
-local function safeTeleport(targetPos, useBounds)
-    local _, hrp, _ = getCharacter()
-    if not hrp then return end
-    local finalPos = targetPos
-    if useBounds then
-        local minV, maxV = getDistanceFadeBounds()
-        finalPos = clampToBounds(targetPos, minV, maxV)
-    end
-    hrp.CFrame = CFrame.new(finalPos)
-end
+-- ══════════════════════════════════════════
+--  ОБРАБОТЧИКИ СОБЫТИЙ
+-- ══════════════════════════════════════════
 
--- ════════════════════════════════════════════════
---  2. СИСТЕМА БЕЗОПАСНОСТИ В ЗОНЕ (Area Constraint)
--- ════════════════════════════════════════════════
+local DANGER = { enemy_aa_king_octopus=true, enemy_aa_moth_overlord=true, enemy_aa_snail_king=true }
 
-local DANGER_ENEMIES = {
-    "enemy_aa_king_octopus",
-    "enemy_aa_moth_overlord",
-    "enemy_aa_snail_king",
-}
-
--- Набор имён врагов для быстрой проверки
-local dangerSet = {}
-for _, name in ipairs(DANGER_ENEMIES) do dangerSet[name] = true end
-
-local function handleDangerEnemy(enemy)
-    -- Защита: сдвинуть персонажа в безопасную точку внутри DistanceFade
+local function onDangerEnemy(enemy)
     if not Enabled then return end
-    local _, hrp, _ = getCharacter()
-    if not hrp then return end
-    setStatus("⚠ Danger! Evading " .. enemy.Name)
-
+    local hrp = getHRP(); if not hrp then return end
+    setStatus("Enemy! Evading " .. enemy.Name)
     local minV, maxV = getDistanceFadeBounds()
-    if not minV then
-        -- Нет DistanceFade — просто поднимаем выше
-        safeTeleport(hrp.Position + Vector3.new(0, 20, 0), false)
-        return
-    end
 
-    -- Попытка уйти подальше от врага в пределах зоны
-    local enemyPos  = enemy.PrimaryPart and enemy.PrimaryPart.Position or hrp.Position
-    local direction = (hrp.Position - enemyPos)
-    if direction.Magnitude < 0.1 then direction = Vector3.new(1, 0, 0) end
-    direction = direction.Unit * 30
-
-    local safePos = clampToBounds(hrp.Position + direction, minV, maxV)
-
-    -- Временно отключаем CanTouch у всех BasePart персонажа
     local char = LocalPlayer.Character
-    local origCanTouch = {}
+    local restore = {}
     if char then
-        for _, part in ipairs(char:GetDescendants()) do
-            if part:IsA("BasePart") then
-                origCanTouch[part] = part.CanTouch
-                part.CanTouch = false
-            end
+        for _, p in ipairs(char:GetDescendants()) do
+            if p:IsA("BasePart") then restore[p]=p.CanTouch; p.CanTouch=false end
         end
     end
 
-    hrp.CFrame = CFrame.new(safePos)
+    local ePos  = pcall(getPos, enemy) and getPos(enemy) or hrp.Position
+    local dir   = (hrp.Position - ePos)
+    dir = ((dir.Magnitude > 0.1) and dir.Unit or Vector3.new(1,0,0)) * 30
+    hrp.CFrame  = CFrame.new(clamp3(hrp.Position + dir, minV, maxV))
     task.wait(1.5)
 
-    -- Восстанавливаем CanTouch
     if char then
-        for part, val in pairs(origCanTouch) do
-            if part and part.Parent then
-                part.CanTouch = val
-            end
+        for p,v in pairs(restore) do
+            if p and p.Parent then p.CanTouch=v end
         end
     end
     setStatus("running")
 end
 
-local function startAreaConstraint()
-    local map = workspace:WaitForChild("Map", 30)
-    if not map then return end
-    local entities = map:WaitForChild("Entities", 30)
-    if not entities then return end
-
-    -- Слушаем добавление новых детей
-    local conn = entities.ChildAdded:Connect(function(child)
-        if not Enabled then return end
-        if dangerSet[child.Name] then
-            task.spawn(handleDangerEnemy, child)
-        end
-    end)
-
-    -- Проверяем уже существующих
-    for _, child in ipairs(entities:GetChildren()) do
-        if dangerSet[child.Name] and Enabled then
-            task.spawn(handleDangerEnemy, child)
-        end
-    end
-
-    -- Сохраняем соединение для отмены
-    table.insert(ActiveThreads, conn)
-end
-
--- ════════════════════════════════════════════════
---  3. АВТО-ФИНИШ (Multi-level Readiness Check)
--- ════════════════════════════════════════════════
-
-local function startAutoFinish()
-    local map = workspace:WaitForChild("Map", 30)
-    if not map then return end
-    local loadedGame = map:WaitForChild("LoadedGame", 30)
-    if not loadedGame then return end
-    local finishFolder = loadedGame:WaitForChild("Finish", 30)
-    if not finishFolder then return end
-    local finishObj = finishFolder:WaitForChild("Finish", 30)
-    if not finishObj then return end
-
-    -- Ждём появления Model с MeshPart и MeshPart2 внутри finishObj
-    local function checkModel(model)
-        if not model:IsA("Model") then return false end
-        local hasMesh1 = model:FindFirstChild("MeshPart")
-        local hasMesh2 = model:FindFirstChild("MeshPart2")
-        return hasMesh1 ~= nil and hasMesh2 ~= nil
-    end
-
-    local function onChildAdded(child)
-        if not Enabled then return end
-        if checkModel(child) then
-            setStatus("Finish ready — teleporting")
-            -- Целевая позиция — позиция объекта Finish
-            local targetPos
-            if finishObj:IsA("BasePart") then
-                targetPos = finishObj.Position
-            elseif finishObj:IsA("Model") and finishObj.PrimaryPart then
-                targetPos = finishObj.PrimaryPart.Position
-            else
-                local firstPart = finishObj:FindFirstChildWhichIsA("BasePart")
-                targetPos = firstPart and firstPart.Position or Vector3.new(0, 0, 0)
-            end
-            safeTeleport(targetPos, false)
-        end
-    end
-
-    -- Уже загруженные
-    for _, child in ipairs(finishObj:GetChildren()) do
-        if checkModel(child) and Enabled then
-            onChildAdded(child)
-            break
-        end
-    end
-
-    local conn = finishObj.ChildAdded:Connect(onChildAdded)
-    table.insert(ActiveThreads, conn)
-end
-
--- ════════════════════════════════════════════════
---  4а. ОБРАБОТКА АССЕТОВ — Unit Pump
--- ════════════════════════════════════════════════
-
-local function handleUnitPump(unitPump)
+local function onUnitPump(pump)
     if not Enabled then return end
-    local _, hrp, _ = getCharacter()
-    if not hrp then return end
-
+    local hrp = getHRP(); if not hrp then return end
     setStatus("Moving to unit_pump")
-    local pumpPos
-    if unitPump:IsA("BasePart") then
-        pumpPos = unitPump.Position
-    elseif unitPump:IsA("Model") and unitPump.PrimaryPart then
-        pumpPos = unitPump.PrimaryPart.Position
-    else
-        local p = unitPump:FindFirstChildWhichIsA("BasePart")
-        pumpPos = p and p.Position or hrp.Position
-    end
-
-    safeTeleport(pumpPos + Vector3.new(0, 3, 3), false)
-    setStatus("Interacting with unit_pump (3s)")
-
-    -- Цикл взаимодействия 3 секунды
+    teleport(getPos(pump) + Vector3.new(0, 3, 3))
     local t = 0
-    while t < 3 and Enabled do
-        pressE()
-        task.wait(0.2)
-        t += 0.2
-    end
+    while t < 3 and Enabled do pressE(); task.wait(0.2); t+=0.2 end
     setStatus("unit_pump done")
 end
 
--- ════════════════════════════════════════════════
---  4б. ОБРАБОТКА АССЕТОВ — Fence Barrier
--- ════════════════════════════════════════════════
-
-local function handleFenceBarrier()
+local function onFenceBarrier()
     if not Enabled then return end
-    local _, hrp, _ = getCharacter()
-    if not hrp then return end
-
-    setStatus("FenceBarrier detected — lifting up")
-
-    -- Поднять персонажа на 15 studs выше
-    local newPos = hrp.Position + Vector3.new(0, 15, 0)
-    safeTeleport(newPos, false)
-
-    -- Создать временную платформу под персонажем
-    if TempPlatform and TempPlatform.Parent then
-        TempPlatform:Destroy()
-    end
-    local platform = Instance.new("Part")
-    platform.Name             = "TempPlatform"
-    platform.Size             = Vector3.new(6, 0.5, 6)
-    platform.Anchored         = true
-    platform.CanCollide       = true
-    platform.BrickColor       = BrickColor.new("Bright yellow")
-    platform.Transparency     = 0.5
-    platform.CFrame           = CFrame.new(newPos + Vector3.new(0, -2.5, 0))
-    platform.Parent           = workspace
-    TempPlatform              = platform
-
-    -- Авто-удаление через 8 секунд
+    local hrp = getHRP(); if not hrp then return end
+    setStatus("fenceBarrier: lift +15")
+    local up = hrp.Position + Vector3.new(0,15,0)
+    hrp.CFrame = CFrame.new(up)
+    if TempPlatform and TempPlatform.Parent then TempPlatform:Destroy() end
+    local plat = Instance.new("Part")
+    plat.Name="TempPlatform"; plat.Size=Vector3.new(6,0.5,6)
+    plat.Anchored=true; plat.CanCollide=true; plat.Transparency=0.4
+    plat.BrickColor=BrickColor.new("Bright yellow")
+    plat.CFrame=CFrame.new(up+Vector3.new(0,-2.5,0))
+    plat.Parent=workspace; TempPlatform=plat
     task.delay(8, function()
-        if platform and platform.Parent then
-            platform:Destroy()
-            if TempPlatform == platform then TempPlatform = nil end
-        end
-        setStatus("running")
+        if plat and plat.Parent then plat:Destroy() end
+        if TempPlatform==plat then TempPlatform=nil end
+        if Enabled then setStatus("running") end
     end)
 end
 
-local function startAssetsWatcher()
-    local map = workspace:WaitForChild("Map", 30)
-    if not map then return end
-    local loadedGame = map:WaitForChild("LoadedGame", 30)
-    if not loadedGame then return end
-    local assets = loadedGame:WaitForChild("Assets", 30)
-    if not assets then return end
+local PLOTS={}; for i=1,20 do PLOTS[tostring(i)]=true end
 
-    local function onAssetAdded(child)
-        if not Enabled then return end
-        if child.Name == "unit_pump" then
-            task.spawn(handleUnitPump, child)
-        elseif child.Name == "fenceBarrier" then
-            task.spawn(handleFenceBarrier)
-        end
-    end
-
-    -- Уже существующие
-    for _, child in ipairs(assets:GetChildren()) do
-        onAssetAdded(child)
-    end
-
-    local conn = assets.ChildAdded:Connect(onAssetAdded)
-    table.insert(ActiveThreads, conn)
-end
-
--- ════════════════════════════════════════════════
---  5. ЛОГИКА РАБОЧИХ ЗОН (Plots 1–20)
--- ════════════════════════════════════════════════
-
-local PLOT_NAMES = {}
-for i = 1, 20 do PLOT_NAMES[tostring(i)] = true end
-
-local function handlePlot(plot)
+local function onPlot(plot, assets)
     if not Enabled then return end
-    setStatus("Plot '" .. plot.Name .. "' appeared — waiting 5s")
-    task.wait(5)
+    setStatus("Plot '"..plot.Name.."' → wait 5s")
+    task.wait(5); if not Enabled then return end
+    local t=0
+    setStatus("Plot '"..plot.Name.."' → pressing E 2s")
+    while t<2 and Enabled do pressE(); task.wait(0.2); t+=0.2 end
     if not Enabled then return end
-
-    -- Сохраняем текущую позицию
-    local _, hrp, _ = getCharacter()
-    if not hrp then return end
-    local savedPos = hrp.Position
-    setStatus("Plot: pressing E (2s) @ " .. plot.Name)
-
-    -- Активируем цикл нажатия E на 2 секунды
-    local elapsed = 0
-    while elapsed < 2 and Enabled do
-        pressE()
-        task.wait(0.2)
-        elapsed += 0.2
-    end
-
-    if not Enabled then return end
-
-    -- Перемещение к unit_pump
-    local map        = workspace:FindFirstChild("Map")
-    local loadedGame = map and map:FindFirstChild("LoadedGame")
-    local assets     = loadedGame and loadedGame:FindFirstChild("Assets")
-    local pump       = assets and assets:FindFirstChild("unit_pump")
-
-    if pump then
-        handleUnitPump(pump)
+    local pump = assets:FindFirstChild("unit_pump")
+    if pump then task.spawn(onUnitPump, pump)
     else
-        -- Если pump ещё не загружен — ждём
-        setStatus("Waiting for unit_pump...")
-        if assets then
-            local p = assets:WaitForChild("unit_pump", 15)
-            if p and Enabled then
-                handleUnitPump(p)
+        setStatus("Waiting unit_pump…")
+        task.spawn(function()
+            local p = waitFor(assets, "unit_pump", 20)
+            if p and Enabled then onUnitPump(p) end
+        end)
+    end
+end
+
+local function checkFinish(model)
+    return model:IsA("Model")
+        and model:FindFirstChild("MeshPart")  ~= nil
+        and model:FindFirstChild("MeshPart2") ~= nil
+end
+
+-- ══════════════════════════════════════════
+--  ГЛАВНАЯ ИНИЦИАЛИЗАЦИЯ (при нажатии ON)
+-- ══════════════════════════════════════════
+
+local function startSystems()
+    task.spawn(function()
+        -- ── Ждём Map ──────────────────────────────────────
+        setStatus("Waiting Map…")
+        local map = workspace:FindFirstChild("Map")
+        if not map then
+            map = waitFor(workspace, "Map", 60)
+        end
+        if not map then setStatus("ERROR: Map not found"); return end
+
+        -- ── 2. Area Constraint (Entities) ─────────────────
+        local entities = map:FindFirstChild("Entities")
+        if entities then
+            for _, c in ipairs(entities:GetChildren()) do
+                if DANGER[c.Name] then task.spawn(onDangerEnemy, c) end
             end
+            local conn = entities.ChildAdded:Connect(function(c)
+                if Enabled and DANGER[c.Name] then task.spawn(onDangerEnemy, c) end
+            end)
+            table.insert(Connections, conn)
         end
-    end
+
+        -- ── Ждём LoadedGame ───────────────────────────────
+        setStatus("Waiting LoadedGame…")
+        local lg = map:FindFirstChild("LoadedGame") or waitFor(map, "LoadedGame", 60)
+        if not lg then setStatus("ERROR: LoadedGame not found"); return end
+
+        -- ── 3. Auto-Finish ────────────────────────────────
+        task.spawn(function()
+            local finFolder = lg:FindFirstChild("Finish") or waitFor(lg, "Finish", 30)
+            if not finFolder then return end
+            local finObj    = finFolder:FindFirstChild("Finish") or waitFor(finFolder, "Finish", 30)
+            if not finObj   then return end
+
+            local function tryFinish(child)
+                if Enabled and checkFinish(child) then
+                    setStatus("Finish ready → teleport!")
+                    teleport(getPos(finObj))
+                end
+            end
+            for _, c in ipairs(finObj:GetChildren()) do tryFinish(c) end
+            local conn = finObj.ChildAdded:Connect(tryFinish)
+            table.insert(Connections, conn)
+        end)
+
+        -- ── 4. Assets ─────────────────────────────────────
+        task.spawn(function()
+            local assets = lg:FindFirstChild("Assets") or waitFor(lg, "Assets", 30)
+            if not assets then return end
+
+            local function onAsset(child)
+                if not Enabled then return end
+                if child.Name == "unit_pump"     then task.spawn(onUnitPump, child)
+                elseif child.Name == "fenceBarrier" then task.spawn(onFenceBarrier)
+                end
+            end
+            for _, c in ipairs(assets:GetChildren()) do onAsset(c) end
+            local conn = assets.ChildAdded:Connect(onAsset)
+            table.insert(Connections, conn)
+
+            -- ── 5. Plots ──────────────────────────────────
+            task.spawn(function()
+                local plots = lg:FindFirstChild("Plots") or waitFor(lg, "Plots", 30)
+                if not plots then return end
+
+                local function onPlotAdded(child)
+                    if Enabled and PLOTS[child.Name] then
+                        task.spawn(onPlot, child, assets)
+                    end
+                end
+                for _, c in ipairs(plots:GetChildren()) do onPlotAdded(c) end
+                local conn2 = plots.ChildAdded:Connect(onPlotAdded)
+                table.insert(Connections, conn2)
+                setStatus("running")
+            end)
+        end)
+    end)
 end
 
-local function startPlotsWatcher()
-    local map = workspace:WaitForChild("Map", 30)
-    if not map then return end
-    local loadedGame = map:WaitForChild("LoadedGame", 30)
-    if not loadedGame then return end
-    local plots = loadedGame:WaitForChild("Plots", 30)
-    if not plots then return end
+-- ══════════════════════════════════════════
+--  TOGGLE
+-- ══════════════════════════════════════════
 
-    local function onPlotAdded(child)
-        if not Enabled then return end
-        if PLOT_NAMES[child.Name] then
-            task.spawn(handlePlot, child)
-        end
-    end
-
-    for _, child in ipairs(plots:GetChildren()) do
-        onPlotAdded(child)
-    end
-
-    local conn = plots.ChildAdded:Connect(onPlotAdded)
-    table.insert(ActiveThreads, conn)
-end
-
--- ════════════════════════════════════════════════
---  ЗАПУСК ВСЕХ СИСТЕМ
--- ════════════════════════════════════════════════
-
--- Ждём полной загрузки игры
-task.spawn(function()
-    -- Небольшая задержка для стабилизации Workspace
-    task.wait(2)
-
-    -- Запускаем все наблюдатели (они сами ждут нужных объектов)
-    task.spawn(startAreaConstraint)
-    task.spawn(startAutoFinish)
-    task.spawn(startAssetsWatcher)
-    task.spawn(startPlotsWatcher)
-end)
-
--- Перезапуск после respawn персонажа
-LocalPlayer.CharacterAdded:Connect(function()
-    task.wait(1)
+ToggleBtn.MouseButton1Click:Connect(function()
+    Enabled = not Enabled
     if Enabled then
-        setStatus("Character respawned — systems active")
+        ToggleBtn.Text             = "Automation: ON"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(30, 120, 30)
+        startSystems()   -- запускаем системы ЗДЕСЬ
+    else
+        ToggleBtn.Text             = "Automation: OFF"
+        ToggleBtn.BackgroundColor3 = Color3.fromRGB(180, 40, 40)
+        stopAll()
     end
 end)
