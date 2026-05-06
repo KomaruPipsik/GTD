@@ -1,0 +1,397 @@
+-- ============================================================
+--  AUTO SCRIPT v1.0  |  LocalScript (executor)
+-- ============================================================
+
+local Players       = game:GetService("Players")
+local RunService    = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local VIM           = game:GetService("VirtualInputManager")
+local TweenService  = game:GetService("TweenService")
+
+local lp            = Players.LocalPlayer
+local char          = lp.Character or lp.CharacterAdded:Wait()
+local hrp           = char:WaitForChild("HumanoidRoot​Part")
+local hum           = char:WaitForChild("Humanoid")
+
+-- ── Обновляем ссылки при респауне ───────────────────────────
+lp.CharacterAdded:Connect(function(c)
+    char = c
+    hrp  = c:WaitForChild("HumanoidRootPart")
+    hum  = c:WaitForChild("Humanoid")
+end)
+
+-- ============================================================
+--  СОСТОЯНИЕ
+-- ============================================================
+local ENABLED       = false
+local connections   = {}   -- все соединения, чтобы отключать
+local floatPart     = nil  -- локальный парт-левитация
+
+-- ============================================================
+--  GUI
+-- ============================================================
+local sg = Instance.new("ScreenGui")
+sg.Name            = "AutoScript"
+sg.ResetOnSpawn    = false
+sg.ZIndexBehavior  = Enum.ZIndexBehavior.Sibling
+sg.Parent          = lp:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Size          = UDim2.new(0, 180, 0, 50)
+frame.Position      = UDim2.new(0, 10, 0.5, -25)
+frame.BackgroundColor3 = Color3.fromRGB(20, 20, 20)
+frame.BorderSizePixel  = 0
+frame.Active        = true
+frame.Draggable     = true
+frame.Parent        = sg
+
+Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
+
+local btn = Instance.new("TextButton")
+btn.Size            = UDim2.new(1, -10, 1, -10)
+btn.Position        = UDim2.new(0, 5, 0, 5)
+btn.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+btn.TextColor3      = Color3.new(1,1,1)
+btn.Font            = Enum.Font.GothamBold
+btn.TextSize        = 16
+btn.Text            = "AUTO  ●  OFF"
+btn.BorderSizePixel = 0
+btn.Parent          = frame
+Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+
+local statusLbl = Instance.new("TextLabel")
+statusLbl.Size   = UDim2.new(1, 0, 0, 16)
+statusLbl.Position = UDim2.new(0, 0, 1, 4)
+statusLbl.BackgroundTransparency = 1
+statusLbl.TextColor3 = Color3.fromRGB(180,180,180)
+statusLbl.Font   = Enum.Font.Gotham
+statusLbl.TextSize = 11
+statusLbl.Text   = ""
+statusLbl.Parent = frame
+
+local function setStatus(txt)
+    statusLbl.Text = txt
+end
+
+-- ============================================================
+--  ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+-- ============================================================
+local function safeTeleport(target)
+    -- Проверяем границу DistanceFade перед ТП
+    local ok, model = pcall(function()
+        return workspace.Map.Model.DistanceFade
+    end)
+    if ok and model then
+        local cf, size = model:GetBoundingBox()
+        local half     = size / 2
+        local tpos     = (type(target) == "Vector3") and target or target.Position
+        -- Clamp позицию внутрь DistanceFade
+        local rel  = cf:PointToObjectSpace(tpos)
+        rel = Vector3.new(
+            math.clamp(rel.X, -half.X + 2, half.X - 2),
+            rel.Y,
+            math.clamp(rel.Z, -half.Z + 2, half.Z - 2)
+        )
+        tpos = cf:PointToWorldSpace(rel)
+        hrp.CFrame = CFrame.new(tpos)
+    else
+        -- Нет модели-границы — ТП напрямую
+        if type(target) == "Vector3" then
+            hrp.CFrame = CFrame.new(target)
+        else
+            hrp.CFrame = target.CFrame
+        end
+    end
+end
+
+local function pressE(times, interval)
+    times    = times or 1
+    interval = interval or 0.1
+    for i = 1, times do
+        VIM:SendKeyEvent(true,  Enum.KeyCode.E, false, game)
+        task.wait(0.03)
+        VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+        if i < times then task.wait(interval) end
+    end
+end
+
+local function spamE(duration, interval)
+    -- Спамим E в течение duration секунд
+    local t = 0
+    interval = interval or 0.15
+    while t < duration and ENABLED do
+        pressE(1)
+        task.wait(interval)
+        t = t + interval
+    end
+end
+
+-- ============================================================
+--  1. ЗАЩИТА ОТ БОССОВ
+-- ============================================================
+local BOSSES = {
+    "enemy_aa_king_octopus",
+    "enemy_aa_moth_overlord",
+    "enemy_aa_snail_king",
+}
+local SAFE_DIST  = 40   -- дистанция угрозы
+local godActive  = false
+
+local function checkBosses()
+    local ok, entities = pcall(function() return workspace.Map.Entities end)
+    if not ok then return end
+    for _, boss in ipairs(BOSSES) do
+        local b = entities:FindFirstChild(boss)
+        if b then
+            local bHRP = b:FindFirstChild("HumanoidRootPart")
+                      or b:FindFirstChildWhichIsA("BasePart")
+            if bHRP then
+                local dist = (hrp.Position - bHRP.Position).Magnitude
+                if dist < SAFE_DIST then
+                    if not godActive then
+                        godActive = true
+                        setStatus("⚠ Босс рядом! Защита активна")
+                        -- Включаем локальный God Mode
+                        hum.MaxHealth = math.huge
+                        hum.Health    = math.huge
+                        -- Отходим вверх, оставаясь в DistanceFade
+                        safeTeleport(hrp.Position + Vector3.new(0, 30, 0))
+                    end
+                    return
+                end
+            end
+        end
+    end
+    -- Боссов нет рядом — сбрасываем
+    if godActive then
+        godActive = false
+        hum.MaxHealth = 100
+        setStatus("")
+    end
+end
+
+-- ============================================================
+--  2. АВТО-ФИНИШ
+-- ============================================================
+local function watchFinish()
+    local ok, finishPart = pcall(function()
+        return workspace.Map.LoadedGame.Finish.Finish
+    end)
+    if not ok or not finishPart then return end
+
+    local function tryFinish()
+        local model = finishPart:FindFirstChild("Model")
+        if model then
+            local m1 = model:FindFirstChild("MeshPart")
+            local m2 = model:FindFirstChild("MeshPart2")
+            if m1 and m2 then
+                setStatus("✔ Финиш! ТП...")
+                safeTeleport(finishPart)
+            end
+        end
+    end
+
+    -- Слушаем появление Model внутри Finish
+    local c = finishPart.ChildAdded:Connect(function(child)
+        if child.Name == "Model" then
+            -- Ждём оба MeshPart
+            child.ChildAdded:Connect(function()
+                tryFinish()
+            end)
+            tryFinish()
+        end
+    end)
+    table.insert(connections, c)
+    -- На случай если Model уже есть
+    tryFinish()
+end
+
+-- ============================================================
+--  3а. UNIT PUMP
+-- ============================================================
+local function handlePump(assets)
+    local pump = assets:FindFirstChild("unit_pump")
+    if pump then
+        local pBase = pump:FindFirstChildWhichIsA("BasePart")
+        if pBase then
+            setStatus("⚙ unit_pump — ТП + спам E")
+            safeTeleport(pBase)
+            task.spawn(function() spamE(3, 0.15) end)
+        end
+    end
+end
+
+-- ============================================================
+--  3б. FENCE BARRIER — ЛЕВИТАЦИЯ
+-- ============================================================
+local function handleFence(fence)
+    -- Проверяем, есть ли модели внутри
+    local hasModels = false
+    for _, v in ipairs(fence:GetChildren()) do
+        if v:IsA("Model") then hasModels = true break end
+    end
+    if not hasModels then return end
+
+    setStatus("🚧 FenceBarrier — левитация")
+    local levPos = hrp.Position + Vector3.new(0, 15, 0)
+    safeTeleport(levPos)
+
+    -- Удаляем старый парт если был
+    if floatPart then floatPart:Destroy() end
+
+    floatPart = Instance.new("Part")
+    floatPart.Size      = Vector3.new(4, 0.5, 4)
+    floatPart.Anchored  = true
+    floatPart.CanCollide = true
+    floatPart.Transparency = 1      -- невидим локально
+    floatPart.CFrame    = CFrame.new(levPos - Vector3.new(0, 3, 0))
+    floatPart.Parent    = workspace
+end
+
+-- ============================================================
+--  4. ЦИКЛ PLOTS
+-- ============================================================
+local activePlots = {}
+
+local function handlePlot(plot, assets)
+    local name = tonumber(plot.Name)
+    if not name or name < 1 or name > 20 then return end
+    if activePlots[plot.Name] then return end
+    activePlots[plot.Name] = true
+
+    task.spawn(function()
+        setStatus("📦 Plot " .. plot.Name .. " — ожидание 5с")
+        task.wait(5)
+        if not ENABLED then activePlots[plot.Name] = nil return end
+
+        -- Запоминаем позицию
+        local savedPos = hrp.Position
+
+        setStatus("📦 Plot " .. plot.Name .. " — спам E")
+        -- Параллельно: после 2с — ТП к pump
+        task.spawn(function()
+            task.wait(2)
+            if not ENABLED then return end
+            local ok, ass = pcall(function() return workspace.Map.LoadedGame.Assets end)
+            if ok then handlePump(ass) end
+        end)
+
+        spamE(3, 0.15)
+
+        activePlots[plot.Name] = nil
+    end)
+end
+
+-- ============================================================
+--  НАБЛЮДЕНИЕ ЗА ASSETS
+-- ============================================================
+local function watchAssets()
+    local ok, assets = pcall(function() return workspace.Map.LoadedGame.Assets end)
+    if not ok then return end
+
+    -- Проверяем текущее состояние
+    handlePump(assets)
+    for _, v in ipairs(assets:GetChildren()) do
+        if v.Name == "fenceBarrier" then handleFence(v) end
+    end
+
+    local c = assets.ChildAdded:Connect(function(child)
+        if not ENABLED then return end
+        if child.Name == "unit_pump" then
+            handlePump(assets)
+        elseif child.Name == "fenceBarrier" then
+            -- Ждём появления моделей внутри
+            child.ChildAdded:Connect(function(v)
+                if v:IsA("Model") then handleFence(child) end
+            end)
+            handleFence(child)
+        end
+    end)
+    table.insert(connections, c)
+end
+
+-- ============================================================
+--  НАБЛЮДЕНИЕ ЗА PLOTS
+-- ============================================================
+local function watchPlots()
+    local ok, plots = pcall(function() return workspace.Map.LoadedGame.Plots end)
+    if not ok then return end
+
+    local ok2, assets = pcall(function() return workspace.Map.LoadedGame.Assets end)
+
+    -- Уже существующие
+    for _, v in ipairs(plots:GetChildren()) do
+        if v:IsA("Model") then handlePlot(v, ok2 and assets or nil) end
+    end
+
+    local c = plots.ChildAdded:Connect(function(child)
+        if not ENABLED then return end
+        if child:IsA("Model") then
+            local ok3, ass = pcall(function() return workspace.Map.LoadedGame.Assets end)
+            handlePlot(child, ok3 and ass or nil)
+        end
+    end)
+    table.insert(connections, c)
+end
+
+-- ============================================================
+--  ГЛАВНЫЙ ЦИКЛ (каждые 0.5с — проверка боссов)
+-- ============================================================
+local heartbeat
+
+local function startAll()
+    -- Запускаем все вотчеры
+    task.spawn(watchFinish)
+    task.spawn(watchAssets)
+    task.spawn(watchPlots)
+
+    -- Heartbeat — защита от боссов
+    heartbeat = RunService.Heartbeat:Connect(function()
+        if not ENABLED then return end
+        checkBosses()
+    end)
+    table.insert(connections, heartbeat)
+end
+
+local function stopAll()
+    for _, c in ipairs(connections) do
+        if c and c.Connected then c:Disconnect() end
+    end
+    connections  = {}
+    activePlots  = {}
+    godActive    = false
+    if floatPart then
+        floatPart:Destroy()
+        floatPart = nil
+    end
+    hum.MaxHealth = 100
+    setStatus("")
+end
+
+-- ============================================================
+--  КНОПКА ON/OFF
+-- ============================================================
+btn.MouseButton1Click:Connect(function()
+    ENABLED = not ENABLED
+    if ENABLED then
+        btn.BackgroundColor3 = Color3.fromRGB(30, 160, 60)
+        btn.Text = "AUTO  ●  ON"
+        startAll()
+    else
+        btn.BackgroundColor3 = Color3.fromRGB(180, 30, 30)
+        btn.Text = "AUTO  ●  OFF"
+        stopAll()
+    end
+end)
+
+-- Анимация кнопки при нажатии
+btn.MouseButton1Down:Connect(function()
+    TweenService:Create(btn, TweenInfo.new(0.08), {
+        Size = UDim2.new(0.95, -10, 0.9, -10)
+    }):Play()
+end)
+btn.MouseButton1Up:Connect(function()
+    TweenService:Create(btn, TweenInfo.new(0.08), {
+        Size = UDim2.new(1, -10, 1, -10)
+    }):Play()
+end)
